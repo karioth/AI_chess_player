@@ -1,11 +1,9 @@
 # chess_model_reworked.py
-# Полная версия модели с конволюциями → dense → self‑attention,
-# где token_in входит в трансформер как второй токен, а token_out берётся из seq[:,1,:]
+# Полная версия модели с конволюциями → dense → self‑attention (Markov input).
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import chess
 
 device = torch.device(
     'mps' if torch.backends.mps.is_available()
@@ -72,11 +70,9 @@ class ChessModel(nn.Module):
     """
     Принимает:
         board_x  – (B,65,16)     тензор состояния
-        token_in – (B,512)       скрытый токен от предыдущего хода
-        mask     – (B,4096) bool маска легальных ходов
+        mask     – (B,4672) bool маска легальных ходов
     Возвращает:
-        logits     – (B,4096)
-        token_out  – (B,512)     обновлённый скрытый токен
+        logits     – (B,4672)
     """
     def __init__(self,
                  in_channels: int = 256,
@@ -131,7 +127,7 @@ class ChessModel(nn.Module):
         self.policy_head = nn.Sequential(
             nn.Linear(token_dim, 1024), nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(1024, 4096)
+            nn.Linear(1024, 4672)
         )
 
         self.value_head = nn.Sequential(
@@ -141,16 +137,10 @@ class ChessModel(nn.Module):
         )
 
 
-    def representation(self,
-                       x: torch.Tensor,
-                       token_in: torch.Tensor
-                       ) -> tuple[torch.Tensor, torch.Tensor]:
+    def representation(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x        – (B,65,16)
-        token_in – (B,512)
-        Возвращает:
-          h         – (B,token_dim) для политики
-          token_out – (B,token_dim) обновлённый токен из трансформера
+        x – (B,65,16)
+        Возвращает h – (B,token_dim) для политики и value
         """
         B = x.size(0)
         special, cells = x[:, 0, :], x[:, 1:, :]  # (B,16) и (B,64,16)
@@ -168,48 +158,32 @@ class ChessModel(nn.Module):
         tokens_cells = torch.cat([y, d], dim=-1)           # (B,64,token_dim)
 
         # 4) готовим вход для трансформера
-        cls_tok  = self.special_embed(special).unsqueeze(1)   # (B,1,token_dim)
-        in_tok   = token_in.unsqueeze(1)                      # (B,1,token_dim)
-        # print("in_tok: ", in_tok.shape)
-        seq      = torch.cat([cls_tok, in_tok, tokens_cells], dim=1)
-        #          └──  index=0   index=1      index=2..65   ──┘
+        cls_tok = self.special_embed(special).unsqueeze(1)  # (B,1,token_dim)
+        seq = torch.cat([cls_tok, tokens_cells], dim=1)
+        #          └──  index=0      index=1..64   ──┘
 
         # 5) пропускаем через Transformer
-        seq = self.transformer(seq)  # (B,66,token_dim)
+        seq = self.transformer(seq)  # (B,65,token_dim)
 
         # 6) вынимаем выходы
-        h         = self.repr_mlp(seq[:, 0, :])  # из CLS
-        token_out = seq[:, 1, :]                 # обновлённый скрытый токен
-        # print("token_out: ", token_out.shape)
-        return h, token_out
+        h = self.repr_mlp(seq[:, 0, :])  # из CLS
+        return h
 
     def forward(self,
                 board_x: torch.Tensor,
-                token_in: torch.Tensor,
                 mask: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         board_x  – (B,65,16)
-        token_in – (B,512)
-        mask     – (B,4096)
+        mask     – (B,4672)
         """
-        h, token_out = self.representation(board_x, token_in)
+        h = self.representation(board_x)
         logits = self.policy_head(h)
-        value = self.value_head(token_out).squeeze(-1)
+        value = self.value_head(h).squeeze(-1)
 
         if mask is not None:
             logits = logits.masked_fill(~mask, float('-inf'))
-        return logits, token_out, value
-
-
-# ------------------------------------------------------------------
-# 🔸 Утилиты
-# ------------------------------------------------------------------
-def index_to_move(idx: int) -> chess.Move:
-    return chess.Move(idx // 64, idx % 64)
-
-def evaluate_move(board: chess.Board, mv: chess.Move) -> bool:
-    return mv in board.legal_moves
+        return logits, value
 
 
 # ------------------------------------------------------------------
@@ -218,8 +192,7 @@ def evaluate_move(board: chess.Board, mv: chess.Move) -> bool:
 if __name__ == "__main__":
     model = ChessModel().to(device)
     dummy_x     = torch.zeros((2, 65, 16), device=device)
-    dummy_token = torch.zeros((2, 512), device=device)
-    logits, tok = model(dummy_x, dummy_token)
-    print("logits shape:", logits.shape)    # (2,4096)
-    print("token_out shape:", tok.shape)    # (2,512)
+    logits, value = model(dummy_x)
+    print("logits shape:", logits.shape)    # (2,4672)
+    print("value shape:", value.shape)      # (2,)
     print("≈ # params:", sum(p.numel() for p in model.parameters()))

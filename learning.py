@@ -14,7 +14,6 @@ KL_BETA    = 0.005
 ENT_COEF   = 0.02
 VF_COEF    = 0.9        # вес критика
 GAMMA      = 0.99
-PENALTY_K  = 0.8
 SAVE_INT   = 50
 BATCH = 64
 
@@ -40,42 +39,35 @@ def train(model: ChessModel,
     for ep in range(1, epochs+1):
         envs = [ChessGame(i) for i in range(BATCH)]
         states, _, masks = states_board_and_masks(envs, device=device)
-        tokens = torch.zeros(BATCH, model.token_dim, device=device)
-
         # t‑1 буферы
-        ps = pm = pa = pl = pr = pv = pt = None
+        ps = pm = pa = pl = pr = pv = None
         done = [False]*BATCH
         step = 0
 
         while not all(done):
 
             # ===== 1. шаг t  ==================================================
-            logits_t, tokens_next, values_t = model(states, tokens, masks)
+            logits_t, values_t = model(states, masks)
             dist_t = Categorical(F.softmax(logits_t, -1))
             actions_t = dist_t.sample()
             logps_t = dist_t.log_prob(actions_t)
 
-            envs, raw_r, done, *_ , kcaps, _ = \
-                ChessGame.process_moves(envs, actions_t.tolist())
+            envs, raw_r, done, *_ = ChessGame.process_moves(envs, actions_t.tolist())
 
             r_t = torch.as_tensor(raw_r,  dtype=torch.float32, device=device)
-            kmask = torch.as_tensor(kcaps, dtype=torch.bool,   device=device)
 
             # ===== 2. PPO‑update на пакете (t‑1) ==============================
             if ps is not None:                                     # (данные t‑1)
                 # --- returns & advantages ------------------------------------
-                shaped_r = pr.clone()
-                shaped_r[kmask] -= PENALTY_K * r_t[kmask]
-
                 done_t1  = torch.as_tensor(done, device=device)
                 # TD‑цель для t‑1: r_{t‑1}+γ·V(s_t)              (V(s_t) ≈ values_t)
-                v_target_prev = shaped_r + GAMMA*values_t.detach()* (~done_t1)
+                v_target_prev = pr + GAMMA*values_t.detach()* (~done_t1)
 
                 adv = (v_target_prev - pv.detach())
                 adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
 
                 # --- policy loss (t‑1) ---------------------------------------
-                logits_prev, _, _ = model(ps, pt, pm)            # pt = prev_tokens
+                logits_prev, _ = model(ps, pm)
                 dist_prev = Categorical(F.softmax(logits_prev, -1))
                 logp_prev = dist_prev.log_prob(pa)       # pa,pl – t‑1
 
@@ -98,12 +90,12 @@ def train(model: ChessModel,
                                    + KL_BETA*kl           \
                                    - ENT_COEF*entropy
 
-                opt.zero_grad()
+                optimizer.zero_grad()
                 loss.backward()
-                opt.step()
+                optimizer.step()
 
                 # лог
-                m_r = shaped_r.mean().item()
+                m_r = pr.mean().item()
                 print(f"[Ep{ep}] step {step:>4} | "
                       f"L={loss:+.4f} PL={policy_loss:+.4f} "
                       f"VL={value_loss:+.4f}, {values_t.mean().item():+.4f} KL={kl:+.4f} "
@@ -113,13 +105,8 @@ def train(model: ChessModel,
             ps, pm  = states, masks
             pa, pl  = actions_t.detach(), logps_t.detach()
             pr, pv  = r_t.detach(), values_t.detach()
-            pt      = tokens.detach()
 
             # ===== 4. prepare следующий цикл ================================
-            tokens  = tokens_next.detach()
-            if any(done):
-                tokens[torch.as_tensor(done, device=device)] = 0.
-
             states, _, masks = states_board_and_masks(envs, device=device)
             step += 1
 

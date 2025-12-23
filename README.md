@@ -92,20 +92,19 @@ The agent’s backbone is a hybrid CNN–Transformer encoder:
 2. **Cell-Wise Dense Embedding**
    A two-layer MLP mapping each of the 64 squares’ feature vectors into a $d_{\text{dense}}$-dimensional embedding.
 
-3. **Special CLS & Memory Token**
+3. **Special CLS Token**
 
    * A special \[CLS] token embedding global board context.
-   * A learnable `token_in` (dim 512) carries temporal memory between moves.
 
 4. **Transformer Encoder**  
    Six layers ($d_{\text{model}} = 512,\; h = 16$) process the sequence  
-   `[CLS]`, `token_in`, and `cells_{1..64}` concatenated as  
-   `\bigl[[CLS], token_in, cells_{1..64}\bigr]`.
+   `[CLS]` and `cells_{1..64}` concatenated as  
+   `\bigl[[CLS], cells_{1..64}\bigr]`.
 
 
 5. **Heads**
 
-   * **Policy:** MLP → 4096 logits (all possible moves) with legal-move masking.
+   * **Policy:** MLP → 4672 logits (AlphaZero-style move planes) with legal-move masking.
    * **Value:** MLP → scalar $V(s)$.
 
 Total learnable parameters: ≈ 30 million.

@@ -5,8 +5,8 @@ from torch.distributions import Categorical
 import torch.nn.functional as F
 import os
 
-from Model import ChessModel, index_to_move
-from Chess_background import ChessGame, states_board_and_masks
+from Model import ChessModel
+from Chess_background import ChessGame, states_board_and_masks, index_to_move
 
 pygame.init()
 
@@ -106,26 +106,19 @@ def main():
         # 1) get state & mask
         states_tensor, _, masks_tensor = states_board_and_masks([game], device)
 
-        # 2) get and move hidden token to CPU
-        token_in = game.get_current_token().to(device).unsqueeze(0)  # shape [1,512]
-
-        # 3) forward in no_grad
+        # 2) forward in no_grad
         with torch.no_grad():
-            logits, token_next, _ = model(states_tensor, token_in, masks_tensor)
+            logits, _ = model(states_tensor, masks_tensor)
 
-        # 4) save token back
-        game.set_current_token(token_next.squeeze(0))
-
-        # 5) sample action
+        # 3) sample action
         probs = F.softmax(logits, dim=1)
         dist = Categorical(probs)
         action = dist.sample().item()
-        mv = index_to_move(action)
+        mv = index_to_move(action, game.board)
 
-        # 6) step environment
+        # 4) step environment
         (games, rewards, dones, agent_wons,
-         reasons, color_strs, valid_count, _,
-         king_caps, _) = ChessGame.process_moves([game], [action])
+         reasons, color_strs, valid_count, _) = ChessGame.process_moves([game], [action])
 
         game       = games[0]
         agent_won  = agent_wons[0]
