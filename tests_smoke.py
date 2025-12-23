@@ -23,15 +23,15 @@ def assert_legal_mask(board: chess.Board, mask: torch.Tensor) -> None:
 
 def test_model_shapes():
     model = ChessModel().to(DEVICE)
-    states, _, _ = states_board_and_masks([ChessGame()], device=DEVICE)
-    logits, value = model(states)
+    piece_ids, global_vec, _, _ = states_board_and_masks([ChessGame()], device=DEVICE)
+    logits, value = model(piece_ids, global_vec)
     assert logits.shape == (1, ACTION_SIZE), logits.shape
     assert value.shape == (1,), value.shape
 
 
 def test_legal_mask_initial():
     game = ChessGame()
-    _, boards, masks = states_board_and_masks([game], device=DEVICE)
+    _, _, boards, masks = states_board_and_masks([game], device=DEVICE)
     assert masks.shape == (1, ACTION_SIZE)
     assert_legal_mask(boards[0], masks[0])
 
@@ -58,7 +58,7 @@ def test_en_passant():
     board = chess.Board("rnbqkbnr/pppppppp/8/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 2")
     game = ChessGame()
     game.board = board
-    _, boards, masks = states_board_and_masks([game], device=DEVICE)
+    _, _, boards, masks = states_board_and_masks([game], device=DEVICE)
     ep_move = chess.Move.from_uci("e5f6")
     idx = move_to_index(ep_move)
     assert idx is not None
@@ -70,7 +70,7 @@ def test_castling():
     board = chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
     game = ChessGame()
     game.board = board
-    _, boards, masks = states_board_and_masks([game], device=DEVICE)
+    _, _, boards, masks = states_board_and_masks([game], device=DEVICE)
     wk = chess.Move.from_uci("e1g1")
     wq = chess.Move.from_uci("e1c1")
     assert masks[0, move_to_index(wk)].item() is True
@@ -79,7 +79,7 @@ def test_castling():
     assert wq in boards[0].legal_moves
 
     board.turn = chess.BLACK
-    _, boards, masks = states_board_and_masks([game], device=DEVICE)
+    _, _, boards, masks = states_board_and_masks([game], device=DEVICE)
     bk = chess.Move.from_uci("e8g8")
     bq = chess.Move.from_uci("e8c8")
     assert masks[0, move_to_index(bk)].item() is True
@@ -91,7 +91,7 @@ def test_castling():
 def test_random_rollout(plies: int = 200):
     game = ChessGame()
     for _ in range(plies):
-        _, boards, masks = states_board_and_masks([game], device=DEVICE)
+        _, _, boards, masks = states_board_and_masks([game], device=DEVICE)
         mask = masks[0]
         legal_indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
         assert legal_indices, "no legal moves found"
@@ -104,6 +104,46 @@ def test_random_rollout(plies: int = 200):
             game = ChessGame()
 
 
+def test_threefold_draw():
+    game = ChessGame()
+    moves = [
+        "g1f3", "g8f6",
+        "f3g1", "f6g8",
+        "g1f3", "g8f6",
+        "f3g1", "f6g8",
+    ]
+    done = False
+    reward = 0.0
+    for uci in moves:
+        idx = move_to_index(chess.Move.from_uci(uci))
+        assert idx is not None
+        reward, done, illegal = game.play_move(idx)
+        assert not illegal
+        if done:
+            break
+    assert done is True
+    assert reward == 0.0
+    assert game.game_over_reason == "threefold_repetition"
+
+
+def test_fifty_move_draw():
+    game = ChessGame()
+    board = chess.Board("8/8/8/8/8/8/8/K6k w - - 99 1")
+    game.board = board
+    game.current_agent_color = board.turn
+    game.color_str = "WHITE"
+    game._reset_repetition_counts()
+
+    move = chess.Move.from_uci("a1a2")
+    idx = move_to_index(move)
+    assert idx is not None
+    reward, done, illegal = game.play_move(idx)
+    assert not illegal
+    assert done is True
+    assert reward == 0.0
+    assert game.game_over_reason == "fifty_move"
+
+
 if __name__ == "__main__":
     test_model_shapes()
     test_legal_mask_initial()
@@ -111,4 +151,6 @@ if __name__ == "__main__":
     test_en_passant()
     test_castling()
     test_random_rollout()
+    test_threefold_draw()
+    test_fifty_move_draw()
     print("All tests passed.")

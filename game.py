@@ -104,11 +104,11 @@ def main():
         clock.tick(2)
 
         # 1) get state & mask
-        states_tensor, _, masks_tensor = states_board_and_masks([game], device)
+        piece_ids, global_vec, _, masks_tensor = states_board_and_masks([game], device)
 
         # 2) forward in no_grad
         with torch.no_grad():
-            logits, _ = model(states_tensor, masks_tensor)
+            logits, _ = model(piece_ids, global_vec, masks_tensor)
 
         # 3) sample action
         probs = F.softmax(logits, dim=1)

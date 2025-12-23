@@ -19,7 +19,7 @@ KNIGHT_DIRS = [
 UNDERPROMOTION_PIECES = [chess.ROOK, chess.BISHOP, chess.KNIGHT]
 UNDERPROMOTION_DF = [0, -1, 1]  # forward, diag-left, diag-right (by df)
 
-PIECE_TO_PLANE = {
+PIECE_TO_ID = {
     (chess.WHITE, chess.PAWN): 0,
     (chess.WHITE, chess.KNIGHT): 1,
     (chess.WHITE, chess.BISHOP): 2,
@@ -43,46 +43,80 @@ def _on_board(file_idx: int, rank_idx: int) -> bool:
     return 0 <= file_idx < 8 and 0 <= rank_idx < 8
 
 
-def board_to_matrix(board: chess.Board) -> torch.Tensor:
+def board_to_piece_ids(board: chess.Board, device_override=None) -> torch.Tensor:
     """
-    Returns an 8x8x16 tensor:
-      - planes 0..11: piece one-hot
-      - planes 12..15: unused (zeros)
+    Returns a length-64 tensor of piece IDs (0 = empty, 1..12 = pieces).
     """
-    mat = torch.zeros((8, 8, 16), dtype=torch.float32, device=device)
+    dev = device_override or device
+    ids = torch.zeros((64,), dtype=torch.long, device=dev)
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
         if piece is None:
             continue
-        plane = PIECE_TO_PLANE[(piece.color, piece.piece_type)]
-        r = chess.square_rank(sq)
-        f = chess.square_file(sq)
-        mat[r, f, plane] = 1.0
-    return mat
+        ids[sq] = PIECE_TO_ID[(piece.color, piece.piece_type)] + 1
+    return ids
 
 
-def add_state_vector(board_matrix: torch.Tensor, board: chess.Board) -> torch.Tensor:
+def halfmove_to_bucket(halfmove_clock: int) -> int:
+    if halfmove_clock <= 5:
+        return halfmove_clock
+    if halfmove_clock <= 9:
+        return 6
+    if halfmove_clock <= 19:
+        return 7
+    if halfmove_clock <= 39:
+        return 8
+    if halfmove_clock <= 59:
+        return 9
+    if halfmove_clock <= 79:
+        return 10
+    if halfmove_clock <= 99:
+        return 11
+    return 12
+
+
+def build_global_ids(board: chess.Board, repetition_count: int, device_override=None):
     """
-    Prepends a 1x16 global vector:
-      [turn, WK, WQ, BK, BQ, ep_present, ep_file(8), halfmove_norm, fullmove_norm]
+    Returns categorical IDs for global state:
+      side_id (0/1),
+      castle_bits (4,),
+      ep_id (0..8),
+      hmc_bucket (0..12),
+      rep_bucket (0..3).
     """
-    global_vec = torch.zeros((1, 16), dtype=torch.float32, device=device)
-    global_vec[0, 0] = 1.0 if board.turn == chess.WHITE else 0.0
-    global_vec[0, 1] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    global_vec[0, 2] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    global_vec[0, 3] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    global_vec[0, 4] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
+    dev = device_override or device
+    side_id = torch.tensor(
+        0 if board.turn == chess.WHITE else 1,
+        dtype=torch.long,
+        device=dev,
+    )
+    castle_bits = torch.tensor(
+        [
+            int(board.has_kingside_castling_rights(chess.WHITE)),
+            int(board.has_queenside_castling_rights(chess.WHITE)),
+            int(board.has_kingside_castling_rights(chess.BLACK)),
+            int(board.has_queenside_castling_rights(chess.BLACK)),
+        ],
+        dtype=torch.long,
+        device=dev,
+    )
 
+    ep_id = 0
     if board.ep_square is not None:
-        global_vec[0, 5] = 1.0
-        ep_file = chess.square_file(board.ep_square)
-        global_vec[0, 6 + ep_file] = 1.0
+        ep_id = chess.square_file(board.ep_square) + 1
+    ep_id = torch.tensor(ep_id, dtype=torch.long, device=dev)
 
-    global_vec[0, 14] = min(board.halfmove_clock, 150) / 150.0
-    global_vec[0, 15] = min(board.fullmove_number, 200) / 200.0
-
-    flat = board_matrix.view(64, 16)
-    return torch.cat([global_vec, flat], dim=0)
+    hmc_bucket = torch.tensor(
+        halfmove_to_bucket(min(board.halfmove_clock, 100)),
+        dtype=torch.long,
+        device=dev,
+    )
+    rep_bucket = torch.tensor(
+        min(repetition_count, 3),
+        dtype=torch.long,
+        device=dev,
+    )
+    return side_id, castle_bits, ep_id, hmc_bucket, rep_bucket
 
 
 def index_to_move(index: int, board: chess.Board) -> chess.Move:
@@ -199,6 +233,25 @@ class ChessGame:
 
         self.current_agent_color = self.board.turn
         self.color_str = "WHITE" if self.current_agent_color == chess.WHITE else "BLACK"
+        self._reset_repetition_counts()
+
+    def _position_key(self):
+        return self.board._transposition_key()
+
+    def _reset_repetition_counts(self):
+        key = self._position_key()
+        self.repetition_counts = {key: 1}
+
+    def _update_repetition_counts(self, irreversible: bool):
+        key = self._position_key()
+        if irreversible:
+            self.repetition_counts = {key: 1}
+        else:
+            self.repetition_counts[key] = self.repetition_counts.get(key, 0) + 1
+
+    def _current_repetition_count(self) -> int:
+        key = self._position_key()
+        return self.repetition_counts.get(key, 1)
 
     # ────────────────────────────────────────────────────────────────────
     def step(self, action: int):
@@ -207,9 +260,13 @@ class ChessGame:
         return next_state, reward, done, {"illegal": illegal}
 
     # ────────────────────────────────────────────────────────────────────
-    def update(self):
-        mat = board_to_matrix(self.board)
-        return add_state_vector(mat, self.board)
+    def update(self, device_override=None):
+        repetition_count = self._current_repetition_count()
+        piece_ids = board_to_piece_ids(self.board, device_override=device_override)
+        global_ids = build_global_ids(
+            self.board, repetition_count, device_override=device_override
+        )
+        return piece_ids, global_ids
 
     # ────────────────────────────────────────────────────────────────────
     def play_move(self, action: int):
@@ -228,7 +285,22 @@ class ChessGame:
             self.game_over_reason = "illegal_move"
             return -1.0, True, True
 
+        irreversible = self.board.is_irreversible(move)
         self.board.push(move)
+        self._update_repetition_counts(irreversible)
+
+        if self.board.can_claim_threefold_repetition():
+            self.game_over = True
+            self.game_over_reason = "threefold_repetition"
+            self.agent_won = None
+            return 0.0, True, False
+
+        if self.board.can_claim_fifty_moves():
+            self.game_over = True
+            self.game_over_reason = "fifty_move"
+            self.agent_won = None
+            return 0.0, True, False
+
         outcome = self.board.outcome(claim_draw=False)
         if outcome is not None:
             self.game_over = True
@@ -275,11 +347,34 @@ class ChessGame:
 def states_board_and_masks(games, device='mps'):
     """
     Returns:
-      states_tensor: [batch, 65, 16]
+      piece_ids_tensor: [batch, 64]
+      global_state: (side, castle_bits, ep, hmc, rep)
       boards: list[chess.Board]
       masks_tensor: [batch, 4672]
     """
-    states_tensor = torch.stack([g.update() for g in games]).float().to(device)
+    piece_ids_list = []
+    side_list = []
+    castle_list = []
+    ep_list = []
+    hmc_list = []
+    rep_list = []
+    for g in games:
+        piece_ids, global_ids = g.update(device_override=device)
+        side_id, castle_bits, ep_id, hmc_bucket, rep_bucket = global_ids
+        piece_ids_list.append(piece_ids)
+        side_list.append(side_id)
+        castle_list.append(castle_bits)
+        ep_list.append(ep_id)
+        hmc_list.append(hmc_bucket)
+        rep_list.append(rep_bucket)
+    piece_ids_tensor = torch.stack(piece_ids_list).to(device)
+    global_state = (
+        torch.stack(side_list).to(device),
+        torch.stack(castle_list).to(device),
+        torch.stack(ep_list).to(device),
+        torch.stack(hmc_list).to(device),
+        torch.stack(rep_list).to(device),
+    )
     boards = [g.board for g in games]
     masks_list = []
     for board in boards:
@@ -290,4 +385,4 @@ def states_board_and_masks(games, device='mps'):
                 mask[idx] = True
         masks_list.append(mask)
     masks_tensor = torch.stack(masks_list)
-    return states_tensor, boards, masks_tensor
+    return piece_ids_tensor, global_state, boards, masks_tensor

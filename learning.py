@@ -27,9 +27,13 @@ def train(model: ChessModel,
           optimizer: optim.Optimizer,
           ckpt_path: str,
           log_csv: str,
-          epochs: int = 200_000):
+          epochs: int = 200_000,
+          batch: int = BATCH,
+          save_int: int = SAVE_INT,
+          device_override: torch.device | None = None):
 
-    model.to(device).train()
+    run_device = device_override or device
+    model.to(run_device).train()
     count_parameters(model)
 
     with open(log_csv, 'w', newline='') as f:
@@ -37,29 +41,29 @@ def train(model: ChessModel,
             ['Ep','Step','Loss','PLoss','VLoss','KL','Ent','R̄_prev']
         )
     for ep in range(1, epochs+1):
-        envs = [ChessGame(i) for i in range(BATCH)]
-        states, _, masks = states_board_and_masks(envs, device=device)
+        envs = [ChessGame(i) for i in range(batch)]
+        piece_ids, global_vec, _, masks = states_board_and_masks(envs, device=run_device)
         # t‑1 буферы
-        ps = pm = pa = pl = pr = pv = None
-        done = [False]*BATCH
+        ps = pg = pm = pa = pl = pr = pv = None
+        done = [False]*batch
         step = 0
 
         while not all(done):
 
             # ===== 1. шаг t  ==================================================
-            logits_t, values_t = model(states, masks)
+            logits_t, values_t = model(piece_ids, global_vec, masks)
             dist_t = Categorical(F.softmax(logits_t, -1))
             actions_t = dist_t.sample()
             logps_t = dist_t.log_prob(actions_t)
 
             envs, raw_r, done, *_ = ChessGame.process_moves(envs, actions_t.tolist())
 
-            r_t = torch.as_tensor(raw_r,  dtype=torch.float32, device=device)
+            r_t = torch.as_tensor(raw_r,  dtype=torch.float32, device=run_device)
 
             # ===== 2. PPO‑update на пакете (t‑1) ==============================
             if ps is not None:                                     # (данные t‑1)
                 # --- returns & advantages ------------------------------------
-                done_t1  = torch.as_tensor(done, device=device)
+                done_t1  = torch.as_tensor(done, device=run_device)
                 # TD‑цель для t‑1: r_{t‑1}+γ·V(s_t)              (V(s_t) ≈ values_t)
                 v_target_prev = pr + GAMMA*values_t.detach()* (~done_t1)
 
@@ -67,7 +71,7 @@ def train(model: ChessModel,
                 adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
 
                 # --- policy loss (t‑1) ---------------------------------------
-                logits_prev, _ = model(ps, pm)
+                logits_prev, _ = model(ps, pg, pm)
                 dist_prev = Categorical(F.softmax(logits_prev, -1))
                 logp_prev = dist_prev.log_prob(pa)       # pa,pl – t‑1
 
@@ -102,15 +106,15 @@ def train(model: ChessModel,
                       f"Ent={entropy:+.4f} R̄_prev={m_r:+.3f}")
 
             # ===== 3. shift t → t‑1  =========================================
-            ps, pm  = states, masks
+            ps, pg, pm  = piece_ids, global_vec, masks
             pa, pl  = actions_t.detach(), logps_t.detach()
             pr, pv  = r_t.detach(), values_t.detach()
 
             # ===== 4. prepare следующий цикл ================================
-            states, _, masks = states_board_and_masks(envs, device=device)
+            piece_ids, global_vec, _, masks = states_board_and_masks(envs, device=run_device)
             step += 1
 
-            if step % SAVE_INT == 0:
+            if step % save_int == 0:
                 torch.save(model.state_dict(), ckpt_path)
                 print(f"[Checkpoint] saved at step {step}")
 
@@ -137,4 +141,4 @@ if __name__ == '__main__':
         print("No checkpoint found — training from scratch.")
 
     opt = optim.Adam(model.parameters(), lr=LR)
-    train(model, opt, CKPT, LOG)
+    train(model, opt, CKPT, LOG, batch=BATCH, save_int=SAVE_INT)

@@ -23,6 +23,22 @@ Upon first execution, `game.py` will automatically download the pretrained model
 
 ---
 
+## Training (CLI)
+
+Use the `train.py` wrapper to override hyperparameters without editing code:
+
+```bash
+python train.py --epochs 10 --batch 8 --save-int 200 --lr 1e-4
+```
+
+Common options:
+
+```bash
+python train.py --ckpt my_ckpt.pth --log my_log.csv --device mps --resume
+```
+
+---
+
 ## Pretrained Weights
 
 | Filename                                   | Size   | SHA-256 Digest |
@@ -82,32 +98,27 @@ Each epoch iterates over a batch of 64 parallel `ChessGame` environments, applyi
 
 ---
 
-### Model Architecture (`chess_model_reworked.py`)
+### Model Architecture (`Model.py`)
 
-The agent’s backbone is a hybrid CNN–Transformer encoder:
+The agent uses a Transformer-only encoder with embedding-based inputs:
 
-1. **Multi-Scale Convolutional Block**
-   Three parallel convolutions (kernel sizes 3×3, 5×5, 7×7) concatenated and followed by a residual tower (4 × 3×3 residual blocks).
+1. **Square Tokens (64)**
+   Each square gets a token built by summing:
+   * a learnable **position embedding** (one per square), and
+   * a learnable **piece embedding** (empty + 12 pieces).
 
-2. **Cell-Wise Dense Embedding**
-   A two-layer MLP mapping each of the 64 squares’ feature vectors into a $d_{\text{dense}}$-dimensional embedding.
+2. **CLS Token (Global Rule State)**
+   The CLS token is a **sum of categorical embeddings**:
+   side-to-move, four castling bits, en-passant file, halfmove bucket,
+   and repetition bucket.
 
-3. **Special CLS Token**
+3. **Transformer Encoder**
+   Six layers ($d_{\text{model}} = 512,\; h = 16$) process the 65 tokens
+   (`[CLS] + 64 squares`).
 
-   * A special \[CLS] token embedding global board context.
-
-4. **Transformer Encoder**  
-   Six layers ($d_{\text{model}} = 512,\; h = 16$) process the sequence  
-   `[CLS]` and `cells_{1..64}` concatenated as  
-   `\bigl[[CLS], cells_{1..64}\bigr]`.
-
-
-5. **Heads**
-
-   * **Policy:** MLP → 4672 logits (AlphaZero-style move planes) with legal-move masking.
-   * **Value:** MLP → scalar $V(s)$.
-
-Total learnable parameters: ≈ 30 million.
+4. **Heads**
+   * **Policy:** MLP on the CLS token → 4672 logits.
+   * **Value:** MLP on the CLS token → scalar $V(s)$.
 
 ---
 
