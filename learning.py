@@ -140,5 +140,5 @@ if __name__ == '__main__':
     else:
         print("No checkpoint found — training from scratch.")
 
-    opt = optim.Adam(model.parameters(), lr=LR)
+    opt = optim.AdamW(model.parameters(), lr=LR)
     train(model, opt, CKPT, LOG, batch=BATCH, save_int=SAVE_INT)

@@ -42,7 +42,7 @@ def main():
         except Exception as exc:
             print("Load error:", exc)
 
-    opt = optim.Adam(model.parameters(), lr=args.lr)
+    opt = optim.AdamW(model.parameters(), lr=args.lr)
     train(
         model,
         opt,
