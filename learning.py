@@ -47,30 +47,45 @@ def train(model: ChessModel,
         piece_ids, global_vec, _, masks = states_board_and_masks(envs, device=run_device)
         # t‑1 буферы
         ps = pg = pm = pa = pl = pr = pv = None
+        p_done = p_alive = None
         done = [False]*batch
         step = 0
 
         while not all(done):
 
             # ===== 1. шаг t  ==================================================
+            done_prev = done[:]
+            alive_prev = torch.as_tensor(
+                [not d for d in done_prev],
+                dtype=torch.bool,
+                device=run_device,
+            )
             logits_t, values_t = model(piece_ids, global_vec, masks)
             dist_t = Categorical(F.softmax(logits_t, -1))
             actions_t = dist_t.sample()
             logps_t = dist_t.log_prob(actions_t)
 
-            envs, raw_r, done, *_ = ChessGame.process_moves(envs, actions_t.tolist())
+            envs, raw_r, done_step, *_ = ChessGame.process_moves(envs, actions_t.tolist())
+            done = [d or ds for d, ds in zip(done, done_step)]
 
             r_t = torch.as_tensor(raw_r,  dtype=torch.float32, device=run_device)
+            done_t = torch.as_tensor(done_step, dtype=torch.bool, device=run_device)
 
             # ===== 2. PPO‑update на пакете (t‑1) ==============================
-            if ps is not None:                                     # (данные t‑1)
+            if ps is not None and p_alive is not None:             # (данные t‑1)
                 # --- returns & advantages ------------------------------------
-                done_t1  = torch.as_tensor(done, device=run_device)
-                # TD‑цель для t‑1: r_{t‑1}+γ·V(s_t)              (V(s_t) ≈ values_t)
-                v_target_prev = pr + GAMMA*values_t.detach()* (~done_t1)
+                # TD‑цель для t‑1: r_{t‑1}+γ·V(s_t)
+                v_target_prev = pr + GAMMA*values_t.detach()* (~p_done)
 
                 adv = (v_target_prev - pv.detach())
-                adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+                mask_prev = p_alive
+                if mask_prev.any():
+                    adv_masked = adv[mask_prev]
+                    adv_mean = adv_masked.mean()
+                    adv_std = adv_masked.std(unbiased=False) + 1e-8
+                    adv = (adv - adv_mean) / adv_std
+                else:
+                    adv = adv.detach()
 
                 # --- policy loss (t‑1) ---------------------------------------
                 logits_prev, _ = model(ps, pg, pm)
@@ -80,17 +95,27 @@ def train(model: ChessModel,
                 ratio = torch.exp(logp_prev - pl)
                 surr1 = ratio * adv
                 surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1+CLIP_EPS) * adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+                if mask_prev.any():
+                    policy_loss = -torch.min(surr1, surr2)[mask_prev].mean()
+                else:
+                    policy_loss = torch.tensor(0.0, device=run_device)
 
-                # --- critic loss (t, текущее состояние!) ---------------------
-                # r_t + γ·V(s_{t+1})  появится только на след. шаге,
-                # поэтому берём one‑step TD‑return с bootstrap‑ом = values_t
-                v_target_current = r_t + GAMMA*values_t.detach()* (~done_t1)
-                value_loss = 0.5*F.mse_loss(values_t.squeeze(-1), v_target_current)
+                # --- critic loss (t‑1) ---------------------------------------
+                if mask_prev.any():
+                    value_loss = 0.5*F.mse_loss(
+                        pv.squeeze(-1)[mask_prev],
+                        v_target_prev[mask_prev]
+                    )
+                else:
+                    value_loss = torch.tensor(0.0, device=run_device)
 
                 # --- доп. метрики --------------------------------------------
-                entropy = dist_prev.entropy().mean()
-                kl = (pl - logp_prev).mean()
+                if mask_prev.any():
+                    entropy = dist_prev.entropy()[mask_prev].mean()
+                    kl = (pl - logp_prev)[mask_prev].mean()
+                else:
+                    entropy = torch.tensor(0.0, device=run_device)
+                    kl = torch.tensor(0.0, device=run_device)
 
                 loss = policy_loss + VF_COEF*value_loss \
                                    + KL_BETA*kl           \
@@ -101,7 +126,10 @@ def train(model: ChessModel,
                 optimizer.step()
 
                 # лог
-                m_r = pr.mean().item()
+                if mask_prev.any():
+                    m_r = pr[mask_prev].mean().item()
+                else:
+                    m_r = 0.0
                 print(f"[Ep{ep}] step {step:>4} | "
                       f"L={loss:+.4f} PL={policy_loss:+.4f} "
                       f"VL={value_loss:+.4f}, {values_t.mean().item():+.4f} KL={kl:+.4f} "
@@ -111,6 +139,8 @@ def train(model: ChessModel,
             ps, pg, pm  = piece_ids, global_vec, masks
             pa, pl  = actions_t.detach(), logps_t.detach()
             pr, pv  = r_t.detach(), values_t.detach()
+            p_done  = done_t.detach()
+            p_alive = alive_prev.detach()
 
             # ===== 4. prepare следующий цикл ================================
             piece_ids, global_vec, _, masks = states_board_and_masks(envs, device=run_device)
