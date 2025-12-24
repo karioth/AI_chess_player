@@ -229,7 +229,8 @@ class ChessGame:
         self.game_over = False
         self.game_over_reason = ""
         self.last_move_was_legal = True
-        self.agent_won = None
+        self.z_white = None
+        self.winner_color = None
 
         self.current_agent_color = self.board.turn
         self.color_str = "WHITE" if self.current_agent_color == chess.WHITE else "BLACK"
@@ -271,19 +272,22 @@ class ChessGame:
     # ────────────────────────────────────────────────────────────────────
     def play_move(self, action: int):
         if self.game_over:
-            self.reset()
-            return 0.0, True, False
+            z = self.z_white if self.z_white is not None else 0.0
+            return z, True, False
 
         self.last_move_was_legal = True
+        self.z_white = None
+        self.winner_color = None
         moved_color = self.current_agent_color
 
         move = index_to_move(action, self.board)
         if move not in self.board.legal_moves:
             self.last_move_was_legal = False
             self.game_over = True
-            self.agent_won = False
             self.game_over_reason = "illegal_move"
-            return -1.0, True, True
+            self.z_white = -1.0 if moved_color == chess.WHITE else 1.0
+            self.winner_color = chess.WHITE if self.z_white > 0 else chess.BLACK
+            return self.z_white, True, True
 
         irreversible = self.board.is_irreversible(move)
         self.board.push(move)
@@ -292,27 +296,28 @@ class ChessGame:
         if self.board.can_claim_threefold_repetition():
             self.game_over = True
             self.game_over_reason = "threefold_repetition"
-            self.agent_won = None
-            return 0.0, True, False
+            self.z_white = 0.0
+            self.winner_color = None
+            return self.z_white, True, False
 
         if self.board.can_claim_fifty_moves():
             self.game_over = True
             self.game_over_reason = "fifty_move"
-            self.agent_won = None
-            return 0.0, True, False
+            self.z_white = 0.0
+            self.winner_color = None
+            return self.z_white, True, False
 
         outcome = self.board.outcome(claim_draw=False)
         if outcome is not None:
             self.game_over = True
             self.game_over_reason = outcome.termination.name.lower()
             if outcome.winner is None:
-                self.agent_won = None
-                return 0.0, True, False
-            if outcome.winner == moved_color:
-                self.agent_won = True
-                return 1.0, True, False
-            self.agent_won = False
-            return -1.0, True, False
+                self.z_white = 0.0
+                self.winner_color = None
+                return self.z_white, True, False
+            self.z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
+            self.winner_color = chess.WHITE if self.z_white > 0 else chess.BLACK
+            return self.z_white, True, False
 
         self.current_agent_color = self.board.turn
         self.color_str = "WHITE" if self.current_agent_color == chess.WHITE else "BLACK"
@@ -320,9 +325,9 @@ class ChessGame:
 
     # ────────────────────────────────────────────────────────────────────
     @staticmethod
-    def process_moves(games, actions):
+    def process_moves(games, actions, auto_reset: bool = True):
         rewards, dones, illegal_moves = [], [], []
-        agent_wons, reasons, color_strs = [], [], []
+        z_whites, winner_colors, reasons, color_strs = [], [], [], []
         valid_moves_count = 0
 
         for g, act in zip(games, actions):
@@ -330,16 +335,17 @@ class ChessGame:
             rewards.append(r)
             dones.append(d)
             illegal_moves.append(ill)
-            agent_wons.append(g.agent_won)
+            z_whites.append(g.z_white)
+            winner_colors.append(g.winner_color)
             reasons.append(g.game_over_reason)
             color_strs.append(g.color_str)
             if g.last_move_was_legal:
                 valid_moves_count += 1
-            if d:
+            if d and auto_reset:
                 g.reset()
 
         return (
-            games, rewards, dones, agent_wons,
+            games, rewards, dones, z_whites, winner_colors,
             reasons, color_strs, valid_moves_count, illegal_moves
         )
 

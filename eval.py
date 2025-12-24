@@ -49,7 +49,7 @@ def select_random_action(mask: torch.Tensor) -> int:
 
 def select_model_action(model, piece_ids, global_state, mask, policy, temperature):
     with torch.no_grad():
-        logits, _ = model(piece_ids, global_state, mask)
+        logits = model(piece_ids, global_state, mask)
     logits = logits[0]
     if policy == "sample":
         temp = max(temperature, 1e-3)
@@ -71,12 +71,12 @@ def select_engine_action(engine, board, mask, limit):
     return idx
 
 
-def outcome_from_move(game: ChessGame, moved_color: bool, model_color: bool):
-    if game.agent_won is None:
+def outcome_from_zwhite(z_white: float | None, model_color: bool):
+    if z_white is None or z_white == 0.0:
         return "draw"
-    if game.agent_won and moved_color == model_color:
-        return "win"
-    return "loss"
+    if model_color == chess.WHITE:
+        return "win" if z_white > 0 else "loss"
+    return "win" if z_white < 0 else "loss"
 
 
 def resolve_engine_path(engine_path: str | None) -> str | None:
@@ -157,14 +157,11 @@ def run_eval(model: ChessModel,
                     else:
                         action = select_random_action(mask[0])
 
-                _, done, illegal = game.play_move(action)
-                if illegal:
-                    done = True
-                    game.agent_won = False if moved_color == model_side else True
+                _, done, _ = game.play_move(action)
 
                 plies += 1
                 if done:
-                    result = outcome_from_move(game, moved_color, model_side)
+                    result = outcome_from_zwhite(game.z_white, model_side)
                     if result == "win":
                         wins += 1
                     elif result == "loss":

@@ -1,36 +1,192 @@
-# train_ppo_value.py
-import os, csv, numpy as np
-import torch, torch.nn.functional as F, torch.optim as optim
+# train_grpo.py
+import os
+import csv
+import random
+
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
 from torch.distributions import Categorical
 
-from Model import ChessModel            # как в вашем chess_model_reworked.py
+from Model import ChessModel
 from Chess_background import ChessGame, states_board_and_masks
 
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
 # ───────── Hyperparameters ─────────
-CLIP_EPS   = 0.2
-KL_BETA    = 0.005
-ENT_COEF   = 0.02
-VF_COEF    = 0.9        # вес критика
-GAMMA      = 0.99
-SAVE_INT   = 50
+CLIP_EPS = 0.2
+ENT_COEF = 0.02
+SAVE_INT = 50
 BATCH = 64
+PPO_EPOCHS = 2
+MINIBATCH_PLIES = 4096
+MAX_PLIES = None  # set to an int to truncate long games
+
 
 def count_parameters(model: torch.nn.Module):
     tot = sum(p.numel() for p in model.parameters())
     trn = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params: {tot:,},  trainable: {trn:,}")
 
-# ─────────────────────────────────────────────────────────────────────
+
+def compute_group_advantages(z_white: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    mean = z_white.mean()
+    std = z_white.std(unbiased=False)
+    if std < eps:
+        return torch.zeros_like(z_white)
+    return (z_white - mean) / (std + eps)
+
+
+def collect_rollouts(model_old: ChessModel,
+                     num_games: int,
+                     run_device: torch.device,
+                     max_plies: int | None = None):
+    envs = [ChessGame(i) for i in range(num_games)]
+    done = [False] * num_games
+    game_len = torch.zeros(num_games, dtype=torch.long, device=run_device)
+    z_white = torch.zeros(num_games, dtype=torch.float32, device=run_device)
+
+    piece_ids_list = []
+    side_list = []
+    castle_list = []
+    ep_list = []
+    hmc_list = []
+    rep_list = []
+    mask_list = []
+    action_list = []
+    logp_list = []
+    game_id_list = []
+
+    while not all(done):
+        alive_indices = [i for i, d in enumerate(done) if not d]
+        if not alive_indices:
+            break
+        alive_envs = [envs[i] for i in alive_indices]
+        piece_ids, global_state, _, masks = states_board_and_masks(
+            alive_envs, device=run_device
+        )
+
+        if not masks.any(dim=1).all():
+            bad = torch.where(~masks.any(dim=1))[0].tolist()
+            raise RuntimeError(f"No legal actions for env indices: {bad}")
+
+        with torch.no_grad():
+            logits = model_old(piece_ids, global_state, masks)
+        dist = Categorical(logits=logits)
+        actions = dist.sample()
+        logp = dist.log_prob(actions)
+
+        piece_ids_list.append(piece_ids)
+        side, castle, ep, hmc, rep = global_state
+        side_list.append(side)
+        castle_list.append(castle)
+        ep_list.append(ep)
+        hmc_list.append(hmc)
+        rep_list.append(rep)
+        mask_list.append(masks)
+        action_list.append(actions)
+        logp_list.append(logp)
+        game_id_list.append(torch.tensor(alive_indices, device=run_device))
+
+        for j, env_idx in enumerate(alive_indices):
+            reward, done_step, _ = envs[env_idx].play_move(actions[j].item())
+            game_len[env_idx] += 1
+            if done_step:
+                done[env_idx] = True
+                z_white[env_idx] = reward
+
+        if max_plies is not None and game_len.max().item() >= max_plies:
+            for env_idx in alive_indices:
+                if not done[env_idx]:
+                    done[env_idx] = True
+                    z_white[env_idx] = 0.0
+
+    piece_ids_tensor = torch.cat(piece_ids_list, dim=0)
+    side_tensor = torch.cat(side_list, dim=0)
+    castle_tensor = torch.cat(castle_list, dim=0)
+    ep_tensor = torch.cat(ep_list, dim=0)
+    hmc_tensor = torch.cat(hmc_list, dim=0)
+    rep_tensor = torch.cat(rep_list, dim=0)
+    masks_tensor = torch.cat(mask_list, dim=0)
+    actions_tensor = torch.cat(action_list, dim=0)
+    logp_tensor = torch.cat(logp_list, dim=0)
+    game_id_tensor = torch.cat(game_id_list, dim=0)
+
+    global_state = (side_tensor, castle_tensor, ep_tensor, hmc_tensor, rep_tensor)
+    return {
+        "piece_ids": piece_ids_tensor,
+        "global_state": global_state,
+        "mask": masks_tensor,
+        "action": actions_tensor,
+        "logp_old": logp_tensor,
+        "side": side_tensor,
+        "game_id": game_id_tensor,
+        "game_len": game_len,
+        "z_white": z_white,
+    }
+
+
+def ppo_grpo_update(model: ChessModel,
+                    optimizer: optim.Optimizer,
+                    rollout: dict,
+                    adv: torch.Tensor,
+                    weights: torch.Tensor,
+                    clip_eps: float,
+                    ent_coef: float,
+                    ppo_epochs: int,
+                    minibatch_plies: int):
+    piece_ids = rollout["piece_ids"]
+    global_state = rollout["global_state"]
+    mask = rollout["mask"]
+    actions = rollout["action"]
+    logp_old = rollout["logp_old"]
+
+    num_plies = actions.size(0)
+    last_loss = None
+    for _ in range(ppo_epochs):
+        indices = torch.randperm(num_plies, device=actions.device)
+        for start in range(0, num_plies, minibatch_plies):
+            idx = indices[start:start + minibatch_plies]
+            piece_mb = piece_ids[idx]
+            global_mb = tuple(t[idx] for t in global_state)
+            mask_mb = mask[idx]
+            action_mb = actions[idx]
+            logp_old_mb = logp_old[idx]
+            adv_mb = adv[idx]
+            weight_mb = weights[idx]
+
+            logits = model(piece_mb, global_mb, mask_mb)
+            logp = F.log_softmax(logits, dim=-1).gather(
+                1, action_mb.unsqueeze(1)
+            ).squeeze(1)
+
+            ratio = torch.exp(logp - logp_old_mb)
+            surr1 = ratio * adv_mb
+            surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_mb
+            pg_loss = -torch.min(surr1, surr2)
+
+            dist = Categorical(logits=logits)
+            ent = dist.entropy()
+
+            loss = (pg_loss * weight_mb).mean() - ent_coef * ent.mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            last_loss = loss.detach()
+    return last_loss
+
+
 def train(model: ChessModel,
           optimizer: optim.Optimizer,
           ckpt_path: str,
           log_csv: str,
-          epochs: int = 200_000,
+          epochs: int = 1000,
           batch: int = BATCH,
           save_int: int = SAVE_INT,
           device_override: torch.device | None = None,
+          ppo_epochs: int = PPO_EPOCHS,
+          minibatch_plies: int = MINIBATCH_PLIES,
+          max_plies: int | None = MAX_PLIES,
           eval_every: int | None = None,
           eval_fn=None):
 
@@ -40,135 +196,76 @@ def train(model: ChessModel,
 
     with open(log_csv, 'w', newline='') as f:
         csv.writer(f).writerow(
-            ['Ep','Step','Loss','PLoss','VLoss','KL','Ent','R̄_prev']
+            ['Ep', 'Loss', 'MeanZ', 'StdZ', 'Plies', 'Games']
         )
-    for ep in range(1, epochs+1):
-        envs = [ChessGame(i) for i in range(batch)]
-        piece_ids, global_vec, _, masks = states_board_and_masks(envs, device=run_device)
-        # t‑1 буферы
-        ps = pg = pm = pa = pl = pr = pv = None
-        p_done = p_alive = None
-        done = [False]*batch
-        step = 0
 
-        while not all(done):
+    model_old = ChessModel().to(run_device)
+    for ep in range(1, epochs + 1):
+        model_old.load_state_dict(model.state_dict())
+        model_old.eval()
 
-            # ===== 1. шаг t  ==================================================
-            done_prev = done[:]
-            alive_prev = torch.as_tensor(
-                [not d for d in done_prev],
-                dtype=torch.bool,
-                device=run_device,
+        rollout = collect_rollouts(
+            model_old, batch, run_device, max_plies=max_plies
+        )
+
+        z_white = rollout["z_white"]
+        a_game = compute_group_advantages(z_white)
+        side = rollout["side"]
+        ones = torch.ones_like(side, dtype=torch.float32)
+        sign = torch.where(side == 0, ones, -ones).to(run_device)
+        adv = sign * a_game[rollout["game_id"]]
+
+        game_len = rollout["game_len"].clamp_min(1).float()
+        weights = (1.0 / game_len)[rollout["game_id"]]
+
+        loss = ppo_grpo_update(
+            model,
+            optimizer,
+            rollout,
+            adv,
+            weights,
+            clip_eps=CLIP_EPS,
+            ent_coef=ENT_COEF,
+            ppo_epochs=ppo_epochs,
+            minibatch_plies=minibatch_plies,
+        )
+
+        mean_z = z_white.mean().item()
+        std_z = z_white.std(unbiased=False).item()
+        plies = rollout["action"].size(0)
+
+        with open(log_csv, 'a', newline='') as f:
+            csv.writer(f).writerow(
+                [ep, f"{loss.item():+.6f}" if loss is not None else "nan",
+                 f"{mean_z:+.3f}", f"{std_z:+.3f}", plies, batch]
             )
-            logits_t, values_t = model(piece_ids, global_vec, masks)
-            dist_t = Categorical(F.softmax(logits_t, -1))
-            actions_t = dist_t.sample()
-            logps_t = dist_t.log_prob(actions_t)
 
-            envs, raw_r, done_step, *_ = ChessGame.process_moves(envs, actions_t.tolist())
-            done = [d or ds for d, ds in zip(done, done_step)]
+        print(
+            f"[Ep{ep}] loss={loss.item() if loss is not None else 0.0:+.4f} "
+            f"z̄={mean_z:+.3f} σ={std_z:+.3f} plies={plies}"
+        )
 
-            r_t = torch.as_tensor(raw_r,  dtype=torch.float32, device=run_device)
-            done_t = torch.as_tensor(done_step, dtype=torch.bool, device=run_device)
-
-            # ===== 2. PPO‑update на пакете (t‑1) ==============================
-            if ps is not None and p_alive is not None:             # (данные t‑1)
-                # --- returns & advantages ------------------------------------
-                # TD‑цель для t‑1: r_{t‑1}+γ·V(s_t)
-                v_target_prev = pr + GAMMA*values_t.detach()* (~p_done)
-
-                adv = (v_target_prev - pv.detach())
-                mask_prev = p_alive
-                if mask_prev.any():
-                    adv_masked = adv[mask_prev]
-                    adv_mean = adv_masked.mean()
-                    adv_std = adv_masked.std(unbiased=False) + 1e-8
-                    adv = (adv - adv_mean) / adv_std
-                else:
-                    adv = adv.detach()
-
-                # --- policy loss (t‑1) ---------------------------------------
-                logits_prev, _ = model(ps, pg, pm)
-                dist_prev = Categorical(F.softmax(logits_prev, -1))
-                logp_prev = dist_prev.log_prob(pa)       # pa,pl – t‑1
-
-                ratio = torch.exp(logp_prev - pl)
-                surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1+CLIP_EPS) * adv
-                if mask_prev.any():
-                    policy_loss = -torch.min(surr1, surr2)[mask_prev].mean()
-                else:
-                    policy_loss = torch.tensor(0.0, device=run_device)
-
-                # --- critic loss (t‑1) ---------------------------------------
-                if mask_prev.any():
-                    value_loss = 0.5*F.mse_loss(
-                        pv.squeeze(-1)[mask_prev],
-                        v_target_prev[mask_prev]
-                    )
-                else:
-                    value_loss = torch.tensor(0.0, device=run_device)
-
-                # --- доп. метрики --------------------------------------------
-                if mask_prev.any():
-                    entropy = dist_prev.entropy()[mask_prev].mean()
-                    kl = (pl - logp_prev)[mask_prev].mean()
-                else:
-                    entropy = torch.tensor(0.0, device=run_device)
-                    kl = torch.tensor(0.0, device=run_device)
-
-                loss = policy_loss + VF_COEF*value_loss \
-                                   + KL_BETA*kl           \
-                                   - ENT_COEF*entropy
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                # лог
-                if mask_prev.any():
-                    m_r = pr[mask_prev].mean().item()
-                else:
-                    m_r = 0.0
-                print(f"[Ep{ep}] step {step:>4} | "
-                      f"L={loss:+.4f} PL={policy_loss:+.4f} "
-                      f"VL={value_loss:+.4f}, {values_t.mean().item():+.4f} KL={kl:+.4f} "
-                      f"Ent={entropy:+.4f} R̄_prev={m_r:+.3f}")
-
-            # ===== 3. shift t → t‑1  =========================================
-            ps, pg, pm  = piece_ids, global_vec, masks
-            pa, pl  = actions_t.detach(), logps_t.detach()
-            pr, pv  = r_t.detach(), values_t.detach()
-            p_done  = done_t.detach()
-            p_alive = alive_prev.detach()
-
-            # ===== 4. prepare следующий цикл ================================
-            piece_ids, global_vec, _, masks = states_board_and_masks(envs, device=run_device)
-            step += 1
-
-            if step % save_int == 0:
-                torch.save(model.state_dict(), ckpt_path)
-                print(f"[Checkpoint] saved at step {step}")
-                if eval_fn:
-                    model.eval()
-                    eval_fn(model, step)
-                    model.train()
-
-        torch.save(model.state_dict(), ckpt_path)
-        print(f"[Epoch {ep} done, checkpoint saved]")
+        if save_int and ep % save_int == 0:
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"[Checkpoint] saved at epoch {ep}")
+            if eval_fn:
+                model.eval()
+                eval_fn(model, ep)
+                model.train()
 
         if eval_every and eval_fn and ep % eval_every == 0:
             model.eval()
             eval_fn(model, ep)
             model.train()
 
+    torch.save(model.state_dict(), ckpt_path)
     print("Training finished.")
 
-# ─────────────────────────────────────────────────────────────────────
+
 if __name__ == '__main__':
-    CKPT  = 'chess_model_transformer_weights_exp2.pth'
-    LOG   = 'grpo_stepwise_log.csv'
-    LR    = 1e-4
+    CKPT = 'chess_model_transformer_weights_exp2.pth'
+    LOG = 'grpo_stepwise_log.csv'
+    LR = 1e-4
 
     model = ChessModel().to(device)
     if os.path.exists(CKPT):

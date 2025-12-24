@@ -75,7 +75,7 @@ def build_inputs(board: chess.Board, device: torch.device):
 def choose_move(model, board: chess.Board, device, policy, temperature):
     piece_ids, global_state, mask = build_inputs(board, device)
     with torch.no_grad():
-        logits, _ = model(piece_ids, global_state, mask)
+        logits = model(piece_ids, global_state, mask)
     logits = logits[0]
 
     if policy == "sample":

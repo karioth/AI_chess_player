@@ -1,6 +1,6 @@
 # ♟️ AI\_chess\_player
 
-A Proximal Policy Optimization (PPO)–Transformer agent trained to play chess from scratch using reinforcement learning.
+A GRPO (terminal-only PPO-clip) Transformer agent trained to play chess from scratch using reinforcement learning.
 
 ---
 
@@ -123,9 +123,12 @@ https://github.com/SargisVardanian/AI_chess_player/releases/download/v1.0-weight
 ```
 AI_chess_player/
 ├─ game.py                   # Single-game simulator + auto-weight download
-├─ train_ppo_value.py        # PPO training loop with value critic
-├─ Chess_background.py       # Environment, reward shaping, and utilities
-├─ chess_model_reworked.py   # Transformer–CNN hybrid network
+├─ train.py                  # Training CLI wrapper
+├─ learning.py               # GRPO training loop (critic-free)
+├─ eval.py                   # Eval runner (random/engine/checkpoint)
+├─ uci_bot.py                # UCI shim for engine-style eval
+├─ Chess_background.py       # Environment + rules/encoding
+├─ Model.py                  # Transformer-only policy network
 ├─ images/                   # Chess piece sprite assets
 ├─ .github/
 │   └─ workflows/
@@ -139,27 +142,17 @@ AI_chess_player/
 
 ## Technical Overview
 
-### PPO Training (`train_ppo_value.py`)
+### GRPO Training (`learning.py`)
 
-We optimize a policy π\_θ(a|s) via the clipped surrogate objective \[1]:
+Training uses a terminal-only, critic-free GRPO loop:
 
-$$
-L^{\text{CLIP}}(\theta) = \mathbb{E}_t \big[ \min(r_t(\theta) \hat{A}_t,\; \mathrm{clip}(r_t(\theta), 1 - \epsilon, 1 + \epsilon)\,\hat{A}_t) \big],
-$$
+* roll out full self-play games with a frozen policy
+* compute group-normalized terminal outcomes from White’s perspective
+* assign per-ply advantages by flipping sign for Black-to-move
+* perform PPO-clip updates over the stored plies (no value head)
 
-where
-$r_t(\theta) = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_\text{old}}(a_t|s_t)}$
-and the advantage estimate $\hat{A}_t$ uses one-step TD bootstrap with discount $\gamma=0.99$.
-
-The total loss includes a value-function term and entropy regularization:
-
-$$
-L(\theta) = L^{\text{CLIP}}(\theta) + c_{v}\,L^{V}(\theta)\;-\;c_{e}\,H[\pi_\theta](s_t),
-$$
-
-with $c_v=0.9$, $c_e=0.02$, and Kullback–Leibler penalty weight $\beta=0.005$.
-
-Each epoch iterates over a batch of 64 parallel `ChessGame` environments, applying gradient updates every step $t$. Models are checkpointed every 50 steps.
+Each epoch rolls out a batch of games and then runs multiple PPO epochs
+over the collected plies. Checkpoints are saved every `save_int` epochs.
 
 ---
 

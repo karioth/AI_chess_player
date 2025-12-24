@@ -12,7 +12,6 @@ class ChessModel(nn.Module):
         mask         – (B,4672) bool legal action mask (optional)
     Returns:
         logits – (B,4672)
-        value  – (B,)
     """
     def __init__(self,
                  token_dim: int = 512,
@@ -46,19 +45,13 @@ class ChessModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(token_dim, 4672),
         )
-        self.value_head = nn.Sequential(
-            nn.Linear(token_dim, token_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(token_dim, 1),
-        )
-
         self.register_buffer("pos_ids", torch.arange(64), persistent=False)
 
     def forward(self,
                 piece_ids: torch.Tensor,
                 global_state: tuple[torch.Tensor, ...] | None = None,
                 mask: torch.Tensor | None = None
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                ) -> torch.Tensor:
         if piece_ids.dtype != torch.long:
             piece_ids = piece_ids.long()
 
@@ -95,11 +88,9 @@ class ChessModel(nn.Module):
 
         cls_out = seq[:, 0, :]
         logits = self.policy_head(cls_out)
-        value = self.value_head(cls_out).squeeze(-1)
-
         if mask is not None:
             logits = logits.masked_fill(~mask, float('-inf'))
-        return logits, value
+        return logits
 
 
 if __name__ == "__main__":
@@ -112,7 +103,6 @@ if __name__ == "__main__":
         torch.zeros((2,), dtype=torch.long),
         torch.zeros((2,), dtype=torch.long),
     )
-    logits, value = model(dummy_ids, dummy_global)
+    logits = model(dummy_ids, dummy_global)
     print("logits shape:", logits.shape)    # (2,4672)
-    print("value shape:", value.shape)      # (2,)
     print("≈ # params:", sum(p.numel() for p in model.parameters()))

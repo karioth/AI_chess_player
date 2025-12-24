@@ -36,15 +36,17 @@ def draw_board(screen, board):
                 key = ('w' if piece.color == chess.WHITE else 'b') + piece.symbol().lower()
                 screen.blit(IMAGES[key], pygame.Rect(c * SQ_SIZE, r * SQ_SIZE, SQ_SIZE, SQ_SIZE))
 
-def draw_end_game_message(screen, game, agent_won, mv, reason, color_str):
+def draw_end_game_message(screen, game, z_white, mv, reason):
     font = pygame.font.SysFont("Arial", 30, bold=True)
     overlay = pygame.Surface((WIDTH, 120), pygame.SRCALPHA)
     overlay.fill((0, 0, 0, 180))
     screen.blit(overlay, (0, HEIGHT // 2 - 60))
-    if agent_won:
-        text1 = font.render(f"{color_str} (Agent) Won!", True, pygame.Color(255, 255, 255))
+    if z_white is None or z_white == 0.0:
+        text1 = font.render("Draw", True, pygame.Color(255, 255, 255))
+    elif z_white > 0:
+        text1 = font.render("White Won!", True, pygame.Color(255, 255, 255))
     else:
-        text1 = font.render(f"{color_str} (Agent) Lost!", True, pygame.Color(255, 0, 0))
+        text1 = font.render("Black Won!", True, pygame.Color(255, 255, 255))
     text2 = font.render(f"Reason: {reason} by move {mv}", True, pygame.Color(255, 200, 200))
     screen.blit(text1, text1.get_rect(center=(WIDTH//2, HEIGHT//2 - 20)))
     screen.blit(text2, text2.get_rect(center=(WIDTH//2, HEIGHT//2 + 20)))
@@ -70,7 +72,7 @@ def main():
     game = ChessGame(game_id=1)
     clock = pygame.time.Clock()
     running = True
-    agent_won = None
+    z_white = None
     mv = None
     reason = None
     color_str = ''
@@ -81,7 +83,7 @@ def main():
                 running = False
 
         if game.game_over:
-            draw_end_game_message(WINDOW, game, agent_won, mv, reason, color_str)
+            draw_end_game_message(WINDOW, game, z_white, mv, reason)
             pygame.display.flip()
             waiting = True
             while waiting and running:
@@ -108,7 +110,7 @@ def main():
 
         # 2) forward in no_grad
         with torch.no_grad():
-            logits, _ = model(piece_ids, global_vec, masks_tensor)
+            logits = model(piece_ids, global_vec, masks_tensor)
 
         # 3) sample action
         probs = F.softmax(logits, dim=1)
@@ -117,11 +119,11 @@ def main():
         mv = index_to_move(action, game.board)
 
         # 4) step environment
-        (games, rewards, dones, agent_wons,
+        (games, rewards, dones, z_whites, winner_colors,
          reasons, color_strs, valid_count, _) = ChessGame.process_moves([game], [action])
 
         game       = games[0]
-        agent_won  = agent_wons[0]
+        z_white    = z_whites[0]
         reason     = reasons[0]
         color_str  = color_strs[0]
 

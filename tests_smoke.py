@@ -24,9 +24,8 @@ def assert_legal_mask(board: chess.Board, mask: torch.Tensor) -> None:
 def test_model_shapes():
     model = ChessModel().to(DEVICE)
     piece_ids, global_vec, _, _ = states_board_and_masks([ChessGame()], device=DEVICE)
-    logits, value = model(piece_ids, global_vec)
+    logits = model(piece_ids, global_vec)
     assert logits.shape == (1, ACTION_SIZE), logits.shape
-    assert value.shape == (1,), value.shape
 
 
 def test_legal_mask_initial():

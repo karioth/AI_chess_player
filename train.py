@@ -11,13 +11,17 @@ from learning import train, device as default_device
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train the chess agent with PPO.")
+    parser = argparse.ArgumentParser(description="Train the chess agent with GRPO.")
     parser.add_argument("--ckpt", default="chess_model_transformer_weights_exp2.pth")
     parser.add_argument("--log", default="grpo_stepwise_log.csv")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--save-int", type=int, default=50)
+    parser.add_argument("--ppo-epochs", type=int, default=2)
+    parser.add_argument("--minibatch-plies", type=int, default=4096)
+    parser.add_argument("--max-plies", type=int, default=0,
+                        help="Optional max plies per game (0 disables).")
     parser.add_argument("--eval-every", type=int, default=0,
                         help="Run evaluation every N epochs (0 disables).")
     parser.add_argument("--eval-on-checkpoint", action="store_true",
@@ -135,6 +139,9 @@ def main():
         batch=args.batch,
         save_int=args.save_int,
         device_override=run_device,
+        ppo_epochs=args.ppo_epochs,
+        minibatch_plies=args.minibatch_plies,
+        max_plies=args.max_plies if args.max_plies > 0 else None,
         eval_every=args.eval_every if args.eval_every > 0 else None,
         eval_fn=eval_callback if (args.eval_every > 0 or args.eval_on_checkpoint) else None,
     )
