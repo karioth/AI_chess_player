@@ -9,6 +9,7 @@ __pycache__/
 # Logs / checkpoints
 *.csv
 *.log
+*.pth
 # Large weights & datasets
 *.pt
 *.h5
