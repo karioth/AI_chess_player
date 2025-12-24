@@ -1,0 +1,5 @@
+readpgn out.pgn
+elo
+mm
+exactdist
+ratings

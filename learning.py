@@ -30,7 +30,9 @@ def train(model: ChessModel,
           epochs: int = 200_000,
           batch: int = BATCH,
           save_int: int = SAVE_INT,
-          device_override: torch.device | None = None):
+          device_override: torch.device | None = None,
+          eval_every: int | None = None,
+          eval_fn=None):
 
     run_device = device_override or device
     model.to(run_device).train()
@@ -117,9 +119,18 @@ def train(model: ChessModel,
             if step % save_int == 0:
                 torch.save(model.state_dict(), ckpt_path)
                 print(f"[Checkpoint] saved at step {step}")
+                if eval_fn:
+                    model.eval()
+                    eval_fn(model, step)
+                    model.train()
 
         torch.save(model.state_dict(), ckpt_path)
         print(f"[Epoch {ep} done, checkpoint saved]")
+
+        if eval_every and eval_fn and ep % eval_every == 0:
+            model.eval()
+            eval_fn(model, ep)
+            model.train()
 
     print("Training finished.")
 

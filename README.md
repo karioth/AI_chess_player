@@ -37,6 +37,71 @@ Common options:
 python train.py --ckpt my_ckpt.pth --log my_log.csv --device mps --resume
 ```
 
+Periodic eval during training:
+
+```bash
+python train.py --epochs 20 --eval-every 2 --eval-games 6
+```
+
+Engine eval during training (requires Stockfish in PATH or `--eval-engine-path`):
+
+```bash
+python train.py --eval-every 5 --eval-opponent engine --eval-engine-path /path/to/stockfish
+```
+
+Checkpoint-vs-previous eval during training (default):
+
+```bash
+python train.py --eval-every 2 --eval-opponent checkpoint
+```
+
+By default, training runs eval on every checkpoint (set `--no-eval-on-checkpoint`
+if you want to disable it).
+
+---
+
+## Evaluation (CLI)
+
+Evaluate against a random baseline:
+
+```bash
+python eval.py --ckpt chess_model_transformer_weights_exp2.pth --games 20
+```
+
+Evaluate against Stockfish (if installed):
+
+```bash
+python eval.py --opponent engine --engine-path /path/to/stockfish --games 10
+```
+
+---
+
+## UCI + fastchess + BayesElo (engine-style eval)
+
+Expose the model as a UCI engine:
+
+```bash
+python uci_bot.py --ckpt chess_model_transformer_weights_exp2.pth
+```
+
+Run an engine-vs-engine match (requires `fastchess` in PATH):
+
+```bash
+bash scripts/run_fastchess.sh new_ckpt.pth old_ckpt.pth out.pgn
+```
+
+Convert PGN → Elo with BayesElo:
+
+```text
+ResultSet>readpgn out.pgn
+ResultSet>elo
+ResultSet-EloRating>mm
+ResultSet-EloRating>exactdist
+ResultSet-EloRating>ratings
+```
+
+The file `scripts/bayeselo_commands.txt` contains the same sequence.
+
 ---
 
 ## Pretrained Weights
