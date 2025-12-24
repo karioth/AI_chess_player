@@ -1,7 +1,6 @@
 # train_grpo.py
 import os
 import csv
-import random
 
 import torch
 import torch.nn.functional as F
@@ -187,8 +186,10 @@ def train(model: ChessModel,
           ppo_epochs: int = PPO_EPOCHS,
           minibatch_plies: int = MINIBATCH_PLIES,
           max_plies: int | None = MAX_PLIES,
+          rollout_model: ChessModel | None = None,
           eval_every: int | None = None,
-          eval_fn=None):
+          eval_fn=None,
+          save_fn=None):
 
     run_device = device_override or device
     model.to(run_device).train()
@@ -196,12 +197,19 @@ def train(model: ChessModel,
 
     with open(log_csv, 'w', newline='') as f:
         csv.writer(f).writerow(
-            ['Ep', 'Loss', 'MeanZ', 'StdZ', 'Plies', 'Games']
+            [
+                'Ep', 'Loss', 'MeanZ', 'StdZ', 'Plies', 'Games',
+                'ArenaW', 'ArenaD', 'ArenaL', 'ArenaScore', 'ArenaPlies',
+                'Promoted'
+            ]
         )
 
     model_old = ChessModel().to(run_device)
     for ep in range(1, epochs + 1):
-        model_old.load_state_dict(model.state_dict())
+        if rollout_model is None:
+            model_old.load_state_dict(model.state_dict())
+        else:
+            model_old.load_state_dict(rollout_model.state_dict())
         model_old.eval()
 
         rollout = collect_rollouts(
@@ -234,10 +242,27 @@ def train(model: ChessModel,
         std_z = z_white.std(unbiased=False).item()
         plies = rollout["action"].size(0)
 
+        arena = None
+        if eval_every and eval_fn and ep % eval_every == 0:
+            model.eval()
+            arena = eval_fn(model, ep)
+            model.train()
+
+        arena_w = arena.get("wins") if arena else ""
+        arena_d = arena.get("draws") if arena else ""
+        arena_l = arena.get("losses") if arena else ""
+        arena_score = f"{arena.get('score'):.3f}" if arena else ""
+        arena_plies = f"{arena.get('avg_plies'):.1f}" if arena else ""
+        promoted = arena.get("promoted", "") if arena else ""
+
         with open(log_csv, 'a', newline='') as f:
             csv.writer(f).writerow(
-                [ep, f"{loss.item():+.6f}" if loss is not None else "nan",
-                 f"{mean_z:+.3f}", f"{std_z:+.3f}", plies, batch]
+                [
+                    ep, f"{loss.item():+.6f}" if loss is not None else "nan",
+                    f"{mean_z:+.3f}", f"{std_z:+.3f}", plies, batch,
+                    arena_w, arena_d, arena_l, arena_score, arena_plies,
+                    promoted
+                ]
             )
 
         print(
@@ -246,19 +271,16 @@ def train(model: ChessModel,
         )
 
         if save_int and ep % save_int == 0:
-            torch.save(model.state_dict(), ckpt_path)
+            if save_fn:
+                save_fn(model, ep)
+            else:
+                torch.save(model.state_dict(), ckpt_path)
             print(f"[Checkpoint] saved at epoch {ep}")
-            if eval_fn:
-                model.eval()
-                eval_fn(model, ep)
-                model.train()
 
-        if eval_every and eval_fn and ep % eval_every == 0:
-            model.eval()
-            eval_fn(model, ep)
-            model.train()
-
-    torch.save(model.state_dict(), ckpt_path)
+    if save_fn:
+        save_fn(model, epochs)
+    else:
+        torch.save(model.state_dict(), ckpt_path)
     print("Training finished.")
 
 

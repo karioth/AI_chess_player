@@ -34,33 +34,24 @@ python train.py --epochs 10 --batch 8 --save-int 200 --lr 1e-4
 Common options:
 
 ```bash
-python train.py --ckpt my_ckpt.pth --log my_log.csv --device mps --resume
+python train.py --candidate-ckpt my_ckpt.pth --log my_log.csv --device mps --resume
 ```
 
-Periodic eval during training:
+Champion gating (arena eval vs best-so-far):
 
 ```bash
-python train.py --epochs 20 --eval-every 2 --eval-games 6
+python train.py --eval-interval 50 --arena-games 80 --promote-threshold 0.55
 ```
 
-Engine eval during training (requires Stockfish in PATH or `--eval-engine-path`):
+Use the champion as the rollout policy (more conservative):
 
 ```bash
-python train.py --eval-every 5 --eval-opponent engine --eval-engine-path /path/to/stockfish
+python train.py --rollout-policy champion
 ```
-
-Checkpoint-vs-previous eval during training (default):
-
-```bash
-python train.py --eval-every 2 --eval-opponent checkpoint
-```
-
-By default, training runs eval on every checkpoint (set `--no-eval-on-checkpoint`
-if you want to disable it).
 
 ---
 
-## Evaluation (CLI)
+## Evaluation (CLI, optional)
 
 Evaluate against a random baseline:
 
@@ -125,6 +116,8 @@ AI_chess_player/
 ├─ game.py                   # Single-game simulator + auto-weight download
 ├─ train.py                  # Training CLI wrapper
 ├─ learning.py               # GRPO training loop (critic-free)
+├─ arena.py                  # Champion vs candidate arena evaluation
+├─ checkpoints.py            # Checkpoint helpers for candidate/champion
 ├─ eval.py                   # Eval runner (random/engine/checkpoint)
 ├─ uci_bot.py                # UCI shim for engine-style eval
 ├─ Chess_background.py       # Environment + rules/encoding
@@ -154,6 +147,11 @@ Training uses a terminal-only, critic-free GRPO loop:
 Each epoch rolls out a batch of games and then runs multiple PPO epochs
 over the collected plies. Checkpoints are saved every `save_int` epochs.
 
+The training CLI (`train.py`) layers an AlphaZero-style champion gating
+loop on top: every `eval-interval` epochs, the latest candidate is evaluated
+against the current champion in an arena. If the candidate exceeds the
+promotion threshold, it becomes the new champion.
+
 ---
 
 ### Model Architecture (`Model.py`)
@@ -176,7 +174,6 @@ The agent uses a Transformer-only encoder with embedding-based inputs:
 
 4. **Heads**
    * **Policy:** MLP on the CLS token → 4672 logits.
-   * **Value:** MLP on the CLS token → scalar $V(s)$.
 
 ---
 

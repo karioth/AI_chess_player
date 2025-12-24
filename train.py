@@ -1,18 +1,44 @@
 import argparse
-import csv
 import os
 
 import torch
 import torch.optim as optim
 
 from Model import ChessModel
-from eval import run_eval
+from arena import run_arena
+from checkpoints import load_checkpoint, save_checkpoint, save_history
 from learning import train, device as default_device
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train the chess agent with GRPO.")
-    parser.add_argument("--ckpt", default="chess_model_transformer_weights_exp2.pth")
+    parser = argparse.ArgumentParser(
+        description="Train the chess agent with GRPO + champion gating."
+    )
+    parser.add_argument(
+        "--ckpt",
+        default=None,
+        help="Deprecated alias for --candidate-ckpt.",
+    )
+    parser.add_argument(
+        "--candidate-ckpt",
+        default="checkpoints/candidate.pth",
+        help="Latest candidate checkpoint path.",
+    )
+    parser.add_argument(
+        "--champion-ckpt",
+        default="checkpoints/champion.pth",
+        help="Champion checkpoint path.",
+    )
+    parser.add_argument(
+        "--history-dir",
+        default="checkpoints/history",
+        help="Optional history directory for periodic candidate snapshots.",
+    )
+    parser.add_argument(
+        "--save-history",
+        action="store_true",
+        help="Save candidate snapshots to --history-dir on checkpoint.",
+    )
     parser.add_argument("--log", default="grpo_stepwise_log.csv")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch", type=int, default=64)
@@ -22,27 +48,15 @@ def parse_args():
     parser.add_argument("--minibatch-plies", type=int, default=4096)
     parser.add_argument("--max-plies", type=int, default=0,
                         help="Optional max plies per game (0 disables).")
-    parser.add_argument("--eval-every", type=int, default=0,
-                        help="Run evaluation every N epochs (0 disables).")
-    parser.add_argument("--eval-on-checkpoint", action="store_true",
-                        help="Run evaluation every time a checkpoint is saved.")
-    parser.add_argument("--no-eval-on-checkpoint", action="store_true",
-                        help="Disable checkpoint-triggered evaluation.")
-    parser.add_argument("--eval-games", type=int, default=8)
-    parser.add_argument("--eval-opponent", choices=["random", "engine", "checkpoint"], default="checkpoint")
-    parser.add_argument("--eval-opponent-ckpt", default=None,
-                        help="Checkpoint path for eval-opponent=checkpoint.")
-    parser.add_argument("--eval-engine-path", default=None)
-    parser.add_argument("--eval-engine-time", type=float, default=0.05)
-    parser.add_argument("--eval-engine-depth", type=int, default=None)
-    parser.add_argument("--eval-model-color", choices=["white", "black", "both"], default="both")
-    parser.add_argument("--eval-policy", choices=["argmax", "sample"], default="argmax")
-    parser.add_argument("--eval-temperature", type=float, default=1.0)
-    parser.add_argument("--eval-seed", type=int, default=0)
-    parser.add_argument("--eval-log-csv", default=None,
-                        help="Per-game log CSV path (supports {epoch}).")
-    parser.add_argument("--eval-summary-csv", default=None,
-                        help="Append summary rows per eval (supports {epoch}).")
+    parser.add_argument("--eval-interval", type=int, default=50,
+                        help="Run arena evaluation every N epochs (0 disables).")
+    parser.add_argument("--arena-games", type=int, default=80)
+    parser.add_argument("--promote-threshold", type=float, default=0.55)
+    parser.add_argument("--arena-policy", choices=["argmax", "sample"], default="argmax")
+    parser.add_argument("--arena-temperature", type=float, default=1.0)
+    parser.add_argument("--arena-seed", type=int, default=0)
+    parser.add_argument("--rollout-policy", choices=["latest", "champion"], default="latest",
+                        help="Policy used for rollout generation.")
     parser.add_argument(
         "--device",
         choices=["cpu", "mps", "cuda"],
@@ -59,81 +73,67 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.no_eval_on_checkpoint:
-        args.eval_on_checkpoint = False
-    elif args.eval_every == 0 and not args.eval_on_checkpoint:
-        args.eval_on_checkpoint = True
+    candidate_ckpt = args.candidate_ckpt
+    if args.ckpt:
+        candidate_ckpt = args.ckpt
     run_device = default_device if args.device is None else torch.device(args.device)
     print("Using device:", run_device)
     model = ChessModel().to(run_device)
-    if args.resume and os.path.exists(args.ckpt):
+    if args.resume and os.path.exists(candidate_ckpt):
         try:
-            model.load_state_dict(torch.load(args.ckpt, map_location=run_device), strict=False)
+            model.load_state_dict(torch.load(candidate_ckpt, map_location=run_device), strict=False)
             print("Model loaded.")
         except Exception as exc:
             print("Load error:", exc)
 
-    def eval_callback(current_model, tag):
-        log_csv = None
-        if args.eval_log_csv:
-            log_csv = args.eval_log_csv.format(epoch=tag)
-        opponent_model = None
-        opponent_ckpt_path = None
-        if args.eval_opponent == "checkpoint":
-            opponent_ckpt_path = args.eval_opponent_ckpt or f"{args.ckpt}.prev"
-            if not os.path.exists(opponent_ckpt_path):
-                torch.save(current_model.state_dict(), opponent_ckpt_path)
-                print(f"[Eval] baseline created at {opponent_ckpt_path}, skipping eval.")
-                return
-            opponent_model = ChessModel().to(run_device)
-            opponent_model.load_state_dict(
-                torch.load(opponent_ckpt_path, map_location=run_device), strict=False
-            )
-            opponent_model.eval()
+    champion_model = ChessModel().to(run_device)
+    champion_loaded = load_checkpoint(champion_model, args.champion_ckpt, run_device)
+    if not champion_loaded:
+        if load_checkpoint(champion_model, candidate_ckpt, run_device):
+            print(f"Champion initialized from {candidate_ckpt}.")
+        else:
+            champion_model.load_state_dict(model.state_dict())
+            print("Champion initialized from current model.")
+        save_checkpoint(champion_model, args.champion_ckpt)
 
-        results = run_eval(
-            model=current_model,
+    def save_candidate(current_model, step):
+        save_checkpoint(current_model, candidate_ckpt)
+        if args.save_history:
+            save_history(current_model, args.history_dir, step, prefix="candidate")
+
+    def arena_callback(current_model, tag):
+        results = run_arena(
+            candidate_model=current_model,
+            champion_model=champion_model,
+            games=args.arena_games,
             run_device=run_device,
-            games=args.eval_games,
-            opponent=args.eval_opponent,
-            opponent_model=opponent_model,
-            engine_path=args.eval_engine_path,
-            engine_time=args.eval_engine_time,
-            engine_depth=args.eval_engine_depth,
-            model_color=args.eval_model_color,
-            policy=args.eval_policy,
-            temperature=args.eval_temperature,
-            seed=args.eval_seed + int(tag),
-            log_csv=log_csv,
+            policy=args.arena_policy,
+            temperature=args.arena_temperature,
+            seed=args.arena_seed + int(tag),
         )
-        print(
-            f"[Eval] {tag} | W/D/L {results['wins']}/{results['draws']}/"
-            f"{results['losses']} | Score {results['score']:.3f} | "
-            f"Elo {results['elo_diff']:+.1f} | Plies {results['avg_plies']:.1f}"
-        )
-        if opponent_ckpt_path:
-            torch.save(current_model.state_dict(), opponent_ckpt_path)
-        if args.eval_summary_csv:
-            summary_path = args.eval_summary_csv.format(epoch=tag)
-            write_header = not os.path.exists(summary_path)
-            with open(summary_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                if write_header:
-                    writer.writerow([
-                        "epoch", "games", "wins", "draws", "losses",
-                        "score", "elo_diff", "avg_plies"
-                    ])
-                writer.writerow([
-                    tag, results["games"], results["wins"], results["draws"],
-                    results["losses"], f"{results['score']:.6f}",
-                    f"{results['elo_diff']:.2f}", f"{results['avg_plies']:.2f}"
-                ])
+        promoted = 0
+        if results["score"] >= args.promote_threshold:
+            champion_model.load_state_dict(current_model.state_dict())
+            save_checkpoint(champion_model, args.champion_ckpt)
+            promoted = 1
+            print(
+                f"[Arena] promoted at {tag} | score {results['score']:.3f} "
+                f"(W/D/L {results['wins']}/{results['draws']}/{results['losses']})"
+            )
+        else:
+            print(
+                f"[Arena] kept champion at {tag} | score {results['score']:.3f} "
+                f"(W/D/L {results['wins']}/{results['draws']}/{results['losses']})"
+            )
+        results["promoted"] = promoted
+        return results
 
     opt = optim.AdamW(model.parameters(), lr=args.lr)
+    rollout_model = champion_model if args.rollout_policy == "champion" else None
     train(
         model,
         opt,
-        args.ckpt,
+        candidate_ckpt,
         args.log,
         epochs=args.epochs,
         batch=args.batch,
@@ -142,8 +142,10 @@ def main():
         ppo_epochs=args.ppo_epochs,
         minibatch_plies=args.minibatch_plies,
         max_plies=args.max_plies if args.max_plies > 0 else None,
-        eval_every=args.eval_every if args.eval_every > 0 else None,
-        eval_fn=eval_callback if (args.eval_every > 0 or args.eval_on_checkpoint) else None,
+        rollout_model=rollout_model,
+        eval_every=args.eval_interval if args.eval_interval > 0 else None,
+        eval_fn=arena_callback if args.eval_interval > 0 else None,
+        save_fn=save_candidate,
     )
 
 
